@@ -1,0 +1,321 @@
+---
+title: "Quantified Self"
+author: "Alan Whitelock-Jones"
+date: "Friday, June 19, 2015"
+output:
+  html_document:
+    css: custom_blue.css
+    highlight: tango
+    theme: null
+---
+
+#  
+
+##Executive Summary
+
+This paper re-examines data from a paper titled "Qualitative Activity Recognition of Weight Lifting Exercises" available at [http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf] in order to build a machine learning algorithm based on training data and use this algorithm to predict 20 unseen occurrences.  
+
+##Data Exploration and Preparation
+
+```{r load_packages, results='hide', message=FALSE, echo=FALSE}
+#Load packages if not already loaded
+suppressWarnings({
+    require(caret)
+    require(xtable)
+    require(foreach)
+    require(doParallel)
+    require(knitr)
+    require(randomForest)
+    require(gbm)
+    require(plyr)
+    })
+setwd('G:/R-ML')
+valid.prop <- 0.40   #Validation Proportion of Training Set
+```
+The training data consists of 19,622 measurements taken from accelerometers mounted on the test subject and the dumbbell during 10 repetitions of single arm curls where the subject was either doing it correctly (class A) or making one of four common errors (classes B to E). The test data consists of 20 of these observations randomly chosen from the original data set.
+
+The original paper took into account that the actual data was based on 10 repetitions of the lift by each of 6 subjects (users), so rather than there being around 20000 observations of 160 variables, each lift was a time series of around 160 observations with the whole lift classified as being of one of the classes A-E.  The original data took "windows" of time and calculated max, mins, means, sd, skewness, kurtosis, etc of the observations within each window.  The `num_window` dimension is in the training (and test) data, so obviously using this variable together with subject should give a perfect result!  Similarly the accurate timestamp data can be used to put each test case back into its original place and determine its class from its nearest neighbours.
+
+The window level calculations are on rows with the flag `new_window`=='yes', but none of the test set data is a new window line, so the aggregate data in the training set is unusable.
+
+Should the algorithm be permitted to include `user_name`?  This could be considered cheating in that the prediction should work for a new unknown user, however it may be that we are trying to inform known users (maybe as the weights get heavier) if they are reverting to previous bad habits, so in the same way as Siri learns your accent the algorithm used could be personalised to a specific user.  Different users with different heights and strengths may look quite different to an accelerometer. For better understanding of the data the user_name variable was retained in the test data (but not used in the Final Model).
+
+So the remaining columns in the training data were:
+
+ - user_name
+ - variables starting with `roll`, `pitch` or `yaw` containing rotational acceleration measures
+ - variables ending with `_x`, `_y`, `_z` for the directional acceleration measures
+ - `classe` (the class we are trying to determine)
+ 
+The training data was further split into training (`r format(100*valid.prop)`%) and validation (`r format(100*(1-valid.prop))`%) subsets.
+
+```{r load_data, results='hide', message=FALSE, echo=FALSE}
+
+#Load the training set variables butonly those variables we want
+train.file <- 'pml-training.csv'
+test.file  <- 'pml-testing.csv'
+
+#List of variables to keep are user_name, roll_*, pitch_*, yaw_*, 
+var.names <- names(read.csv(train.file, nrows=2))
+var.class <- rep('NULL', length(var.names))
+var.class[var.names=='user_name']                   <- 'factor'
+var.class[var.names=='classe']                      <- 'factor'
+var.class[grep('^.*_(x|y|z)$', var.names)]          <- 'numeric'
+var.class[grep('^(roll|pitch|yaw)_.*$', var.names)] <- 'numeric'
+
+#Load the data and split into a training and validation subsets
+training <- read.csv(train.file, col.names=var.names, colClasses=var.class)
+set.seed(1234)
+ntrain <-nrow(training)
+idx.valid <- sample(ntrain, valid.prop * ntrain)
+valid <- training[idx.valid,]
+training <- training[-idx.valid,]
+```
+
+##Preliminary Analysis
+
+Random forests make particularly strong classifiers.  They are good at situations with outlier data as it doesn't matter how far out an outlier is, just which side of a boundary it falls on.  Random forests can also calculate a measure of the importance of the input variables during the fitting process.
+
+To explore which dimensions are relevant a simple random forest was 'learned' from the training set using the default tuning assumptions and the `features` used in the model ranked by importance.
+
+```{r, random.forest, results='hide', echo=FALSE, message=FALSE}
+
+#Train a simple random forest to examine importance of variables 
+if (!file.exists('FOREST.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    FOREST <- train(classe~.
+                    ,data=training
+                    ,method='rf', importance=TRUE)
+    stopCluster(cl)
+    save(FOREST, file='forest.RData')
+} else {
+    load('forest.RData')
+}
+```
+
+```{r, imp.plot, echo=FALSE, fig.width=7, fig.height=6}
+
+#plot importance
+FOREST.varImp <- varImp(FOREST)    
+plot(FOREST.varImp, main = "Top 20 Important variables", top = 20)
+```
+
+From the importance listing, it seems the model is on the right track.  The dumbbell vertical forces (`dumbbell_acceleration_z`, ie lifting the weight) is important to identify that the lift is being done properly for `classe==A`, and `roll_belt` is important to identify movement in the hips for `classe==E`.
+
+What also stands out is that the `user_name` variable is not important.  This implies that the model is not very dependent on the particular individual performing the exercise.  The confusion matrix for this  model on the validation set is:
+
+```{r confusion, results='asis', echo=FALSE}
+
+#predict validation cases
+FOREST.confusion <- confusionMatrix(predict(FOREST, valid), valid$classe)
+print(xtable(FOREST.confusion$table, align=rep('c',6)), type='html')
+```
+With accuracy = `r format(100*FOREST.confusion$overall['Accuracy'],scientific=FALSE, digits=3)`% (on the training data).
+
+```{r, no.class, results='hide', echo=FALSE, message=FALSE}
+
+#train the same random forest leaving out user_name
+if (!file.exists('NOCLASS.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    NOCLASS <- train(classe~.-user_name
+                    ,data=training
+                    ,method='rf', importance=FALSE)
+    stopCluster(cl)
+    save(NOCLASS, file='NOCLASS.RData')
+} else {
+    load(file='NOCLASS.RData')
+}
+
+#predict validation
+NOCLASS.confusion <- confusionMatrix(predict(NOCLASS, valid), valid$classe)
+```
+
+Dropping the `user_name` variable changes the accuracy to `r format(100*NOCLASS$results[3,'Accuracy'], scientific=FALSE, digits=3)`% on the training set and `r format(100*NOCLASS.confusion$overall['Accuracy'],scientific=FALSE, digits=3)`% (on the validation data).
+
+
+##Principal Component Analysis
+
+Does preprocessing with Principal Component Analysis improve the predictions?  This may be the case as the Random Forests draws boundary lines parallel to the axis.  PCA ensures all the axes are orthogonal.  By setting the number of variables to the large number of 20 it ensures any worsening is not due to having fewer predictors.
+
+```{r, pca, results='hide', echo=FALSE}
+
+#Train the same random forest leaving out user_name but doing PCA as preprocessing
+if (!file.exists('PCA.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    PCA <- train(classe~.-user_name
+                ,data=training
+                ,preProcess='pca'
+                ,pcaComp=20
+                ,method='rf')
+    stopCluster(cl)
+    save(PCA, file='PCA.RData')
+} else {
+    load('PCA.RData')        
+}
+#predict validation cases
+PCA.confusion <- confusionMatrix(predict(PCA, valid), valid$classe)
+```
+
+The accuracy of this model is `r format(100*PCA.confusion$overall['Accuracy'],scientific=FALSE, digits=3)`% on the training data which is worse than non PCA.
+
+Although PCA does not improve this Random Forest model, PCA is useful to visualise the data.  The plot below shows the training sets first 2 principle components plotted against each other, with the plot split by `user_name` and actual `classe` and the colour showing the `predicted` classe.
+
+```{r pretty.plot, echo=FALSE, fig.height=6, fig.width=7}
+
+#prepare data frame containing PCA components 1:2
+PCA.comps <- princomp(training[,c(-1,-50)])
+plot.data <-cbind(valid[,c('user_name','classe')]              #user and correct classe
+                  ,data.frame(predicted=predict(PCA, valid))   #predicted by FOREST model
+                  ,predict(PCA.comps, newdata=valid)[,1:2]     #first two principle comps
+                  ) 
+
+#Plot two most significant components
+ggplot(data=subset(plot.data, predicted==classe), aes(x=Comp.1,y=Comp.2 ,col=predicted)) +
+    geom_point() +
+    geom_point(data=subset(plot.data, predicted!=classe)
+               ,aes(x=Comp.1,y=Comp.2 ,col=predicted)) +       #show incorrect on top
+    facet_wrap(user_name~classe)
+```
+
+The graph shows that the data has patterns that can distinuish the different `classe`s indepependently of the users, but with similarites by `classe`.  The colour highlights points that are misclassified.
+
+##Boosting
+
+Another approach tested is using a Boosted tree classifier.  A boosted model was built (on the same training sample) using the `gbm` package to produce a `g`eneralized `b`oosted tree `m`odel. 
+
+```{r, boost, results='hide', echo=FALSE}
+
+#Train a Generalised Boosted model (default to a tree model)
+if (!file.exists('Boost.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    BOOST <- train(classe~.-user_name
+               ,data=training
+               ,method='gbm'
+               ,tuneLength=10
+               ,verbose=FALSE)
+    stopCluster(cl)
+    save(BOOST, file='Boost.RData')
+} else {
+    load('Boost.RData')
+}
+BOOST.confusion <- confusionMatrix(predict(BOOST, valid), valid$classe)
+```
+
+With an accuracy on the validation data of `r format(100*BOOST.confusion$overall['Accuracy'],scientific=FALSE, digits=3)`% which is better than the random forest.
+
+##Final Model
+
+So the final proposed model is a boosted tree model without PCA preprocessing but excluding `user_name` as a predictor.  In order to estimate the accuracy of the prediction 10 fold cross validation was performed.  This leaves out a different 10% sample each time and fits the model 10 times, each fit on 90% of the data (It also takes a long time to run).  Each model is tested against the 10% excluded data to provide an estimate of the overall out-of-sample prediction error.
+
+```{r final.model, echo=FALSE}
+
+#Build the final model and test on validation data
+if (!file.exists('FINAL.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    ctl <- trainControl(method="cv", number=10)
+    FINAL <- train(classe~.-user_name
+                ,data=training
+                ,method="gbm"
+                ,tuneLength=10
+                ,verbose=FALSE
+                ,trControl=ctl)
+    stopCluster(cl)
+    save(FINAL,file='Final.RData')
+} else {
+    load(file='Final.RData')
+}
+FINAL.confusion = confusionMatrix(predict(FINAL, valid), valid$classe)
+```
+
+The model provided an estimate of its own accuracy as:
+
+ - Estimate of accuracy (from training data 10 fold validation)= `r format(100*max(FINAL$results$Accuracy), digits=3)`%
+ - Estimate of s.d. of accuracy = `r format(100*FINAL$results$AccuracySD[which.max(FINAL$results$Accuracy)], digits=2)`%
+ - Measured Accuracy on validation data = `r format(100*FINAL.confusion$overall['Accuracy'],scientific=FALSE, digits=3)`%  
+
+
+##Predicting the test data
+
+The predicted test results on the 20 hold out values using the various models are shown in the table below
+
+```{r predict, results='asis', echo=FALSE}
+
+#Load the test data and test on all models
+test <- read.csv(test.file, col.names=var.names, colClasses=var.class)
+test.results <- data.frame(
+             FOREST=predict(FOREST,test)
+            ,NOCLASS=predict(NOCLASS,test) 
+            ,PCA=predict(PCA, test)
+            ,BOOST=predict(BOOST, test)
+            ,FINAL=predict(FINAL, test))
+
+#print the results
+print(xtable(test.results, align='lccccc'), type='html')
+```
+
+##Final Comments
+
+Although this model appears pretty good at predicting if these users are making errors, it is not very good at predicting its own out-of-sample error.  In practise deleting `user_name` from the data does not delete the ability of an overfitted model to distinguish between users and for the model to include rules specific to each user.  The chances are that the small user set have other identifying characteristics such as left-handedness, larger forces (strength), wobblyness, etc that are just as identifying as `user_name`.  An estimate we can make of the likely error for an unseen user is to build the model excluding a single user and see how well it predicts the results for the excluded user. The approach takes a rather long time to fit, but as an example of the reduction in performance, the following statistics were calculated from fitting a random forest excluding one user and testing on the excluded user based on 20% of the training data.
+
+```{r user.accuracy, echo=FALSE, results='asis'}
+
+#create models for leave-out-one user using a subsable (for speed) and a random forest
+train.20pc <- training[sample(nrow(training), 0.2*nrow(training)),]
+if (!file.exists('Users.RData')){
+    cl <- makeCluster(detectCores()-1)
+    registerDoParallel(cl)
+    user_accuracy <- foreach (user=levels(training$user_name)
+                              ,.packages=('caret')
+                              ,.combine=c)  %dopar% ({
+                                  
+        train.data <- subset(train.20pc, user_name != user)
+        test.data  <- subset(train.20pc, user_name == user)
+        MDL <- train(classe~.-user_name
+                     ,data=train.data
+                     ,method="rf"
+                     ,verbose=FALSE)
+        save(MDL, file=paste0(user, '.RData'))
+        CONF<- confusionMatrix(predict(MDL, newdata=test.data), test.data$classe)
+        CONF$overall['Accuracy']
+        })
+    stopCluster(cl)
+    names(user_accuracy) <- levels(training$user_name)
+    user_accuracy['MEAN'] <- mean(user_accuracy)
+    save(user_accuracy, file='Users.RData')
+} else {
+    load(file='Users.RData')
+}
+
+#print table by user name
+print(xtable(data.frame(
+     user=names(user_accuracy)
+     ,accuracy=paste0(format(user_accuracy*100, digits=3),'%'))
+     ,align='llc')
+    , type='html', include.rownames=FALSE)
+```
+
+This is better than the 20% a random model would get, but nowhere close to the 90's achieved by the same algorithm when predicting for users that were included in the training data.  My conclusion is that the Final Model, while good at predicting the test set would not be very good at predictions about a new test subject.
+
+```{r submit, echo=FALSE}
+
+#write out the test data for submission
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(test.results$FINAL)
+```
+
+#APPENDIX: R Code Listing
+
+```{r RCode, eval=FALSE, ref.label=all_labels(), echo=TRUE, cache=FALSE}
+```
